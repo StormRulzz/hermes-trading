@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+state/trades.jsonl
+state/heartbeat.json
+state/hypotheses.jsonl
+state/history/
