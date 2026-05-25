@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import logging
+import os
 import yaml
 from pathlib import Path
 
@@ -13,7 +14,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GOAL_PATH = Path(__file__).parent.parent / "state" / "goal.yaml"
+GOAL_PATH = Path(os.environ.get("HERMES_STATE_DIR", str(Path(__file__).parent.parent / "state"))) / "goal.yaml"
 
 
 def main() -> None:
