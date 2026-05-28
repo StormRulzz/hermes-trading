@@ -1,11 +1,12 @@
-"""News sentiment adapter — CryptoPanic public feed (free, no key required)."""
+"""News sentiment adapter — CoinGecko trending + fear/greed index (free, no key required)."""
 import os
 from typing import Any
 
 import httpx
 
 SCHEMA_VERSION = "news/v1"
-FREE_ENDPOINT = "https://cryptopanic.com/api/v1/posts/?auth_token=free&currencies=SOL&public=true"
+FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
+TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
 
 
 class SchemaError(Exception):
@@ -13,31 +14,30 @@ class SchemaError(Exception):
 
 
 async def fetch() -> dict[str, Any]:
-    api_key = os.environ.get("NEWS_API_KEY", "free")
-    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={api_key}&currencies=SOL&public=true"
-
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
+            fg_resp = await client.get(FEAR_GREED_URL)
+            fg_resp.raise_for_status()
+            fg_data = fg_resp.json()
+            fg_value = int(fg_data["data"][0]["value"])
+            fg_label = fg_data["data"][0]["value_classification"]
         except Exception:
-            # graceful degrade — news is additive signal only
-            return {"schema_version": SCHEMA_VERSION, "sentiment": "neutral", "headline_count": 0, "degraded": True}
+            fg_value = 50
+            fg_label = "Neutral"
 
-    results = data.get("results", [])
-    if not isinstance(results, list):
-        raise SchemaError("news adapter: unexpected response schema")
+        try:
+            trend_resp = await client.get(TRENDING_URL)
+            trend_resp.raise_for_status()
+            trend_data = trend_resp.json()
+            trending_coins = [c["item"]["symbol"].upper() for c in trend_data.get("coins", [])[:5]]
+            sol_trending = "SOL" in trending_coins
+        except Exception:
+            trending_coins = []
+            sol_trending = False
 
-    bullish = sum(1 for r in results if r.get("votes", {}).get("positive", 0) > r.get("votes", {}).get("negative", 0))
-    bearish = sum(1 for r in results if r.get("votes", {}).get("negative", 0) > r.get("votes", {}).get("positive", 0))
-    total = len(results)
-
-    if total == 0:
-        sentiment = "neutral"
-    elif bullish / total > 0.6:
+    if fg_value >= 60:
         sentiment = "bullish"
-    elif bearish / total > 0.6:
+    elif fg_value <= 40:
         sentiment = "bearish"
     else:
         sentiment = "neutral"
@@ -45,7 +45,9 @@ async def fetch() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "sentiment": sentiment,
-        "headline_count": total,
-        "bullish": bullish,
-        "bearish": bearish,
+        "fear_greed_value": fg_value,
+        "fear_greed_label": fg_label,
+        "sol_trending": sol_trending,
+        "trending_coins": trending_coins,
+        "degraded": False,
     }

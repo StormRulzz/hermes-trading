@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,11 +17,11 @@ from hermes_trading.score import score
 
 logger = logging.getLogger(__name__)
 
-STATE_DIR = Path(__file__).parent.parent / "state"
+STATE_DIR = Path(os.environ.get("HERMES_STATE_DIR", str(Path(__file__).parent.parent / "state")))
 STRATEGY_PATH = STATE_DIR / "strategy.yaml"
 TRADES_PATH = STATE_DIR / "trades.jsonl"
 HEARTBEAT_PATH = STATE_DIR / "heartbeat.json"
-GOAL_PATH = STATE_DIR / "goal.yaml"
+POSITION_PATH = STATE_DIR / "position.json"
 
 ADAPTERS = [
     ("price", price_fetch),
@@ -32,6 +33,7 @@ ADAPTERS = [
 MAX_RETRIES = 3
 CIRCUIT_BREAK_THRESHOLD = 5
 LOOP_INTERVAL_SECONDS = 60
+RSI_EXIT_THRESHOLD = 50  # exit long when RSI recovers above this
 
 
 async def _fetch_with_retry(name: str, fn) -> dict | None:
@@ -52,8 +54,25 @@ def _load_strategy() -> dict:
     return yaml.safe_load(STRATEGY_PATH.read_text())
 
 
+def _load_position() -> dict | None:
+    if POSITION_PATH.exists():
+        try:
+            return json.loads(POSITION_PATH.read_text())
+        except Exception:
+            return None
+    return None
+
+
+def _save_position(position: dict) -> None:
+    POSITION_PATH.write_text(json.dumps(position))
+
+
+def _close_position() -> None:
+    if POSITION_PATH.exists():
+        POSITION_PATH.unlink()
+
+
 def _evaluate_entry(strategy: dict, price_data: dict) -> bool:
-    """Return True when entry conditions are met."""
     entry = strategy.get("entry", {})
     indicator = entry.get("indicator", "rsi")
     threshold = entry.get("threshold", 30)
@@ -63,43 +82,81 @@ def _evaluate_entry(strategy: dict, price_data: dict) -> bool:
         rsi = price_data.get("rsi")
         if rsi is None:
             return False
-        if direction == "long":
-            return rsi < threshold
-        else:
-            return rsi > threshold
+        return rsi < threshold if direction == "long" else rsi > threshold
     return False
 
 
-def _paper_trade(asset: str, strategy: dict, price_data: dict) -> dict | None:
-    """Execute a paper trade; return trade record or None."""
-    if not _evaluate_entry(strategy, price_data):
+def _tick_position(strategy: dict, price_data: dict) -> dict | None:
+    """Check open position for exit. Returns closed trade record or None."""
+    position = _load_position()
+    if not position:
         return None
 
-    entry_price = price_data.get("close", 0.0)
-    if entry_price <= 0:
-        return None
-
+    close = price_data.get("close", 0.0)
+    low = price_data.get("low", close)
+    rsi = price_data.get("rsi")
+    direction = position.get("direction", "long")
+    entry_price = position["entry_price"]
     stop_loss_pct = strategy.get("stop_loss_pct", 2.0) / 100
-    direction = strategy.get("entry", {}).get("direction", "long")
+
+    exit_price = None
+    exit_reason = None
 
     if direction == "long":
-        exit_price = entry_price * (1 - stop_loss_pct)
-        pnl_pct = (exit_price - entry_price) / entry_price
-    else:
-        exit_price = entry_price * (1 + stop_loss_pct)
-        pnl_pct = (entry_price - exit_price) / entry_price
+        stop_price = entry_price * (1 - stop_loss_pct)
+        if low <= stop_price:
+            exit_price = stop_price
+            exit_reason = "stop_loss"
+        elif rsi is not None and rsi > RSI_EXIT_THRESHOLD:
+            exit_price = close
+            exit_reason = "rsi_exit"
 
-    return {
+    if exit_price is None:
+        return None
+
+    pnl_pct = (exit_price - entry_price) / entry_price
+    trade = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "asset": asset,
+        "asset": position.get("asset", "SOL/USDT"),
         "strategy_version": strategy.get("version", "01"),
         "direction": direction,
         "entry_price": entry_price,
-        "exit_price": exit_price,
+        "exit_price": round(exit_price, 6),
         "pnl_pct": round(pnl_pct, 6),
-        "rsi": price_data.get("rsi"),
+        "exit_reason": exit_reason,
+        "rsi_at_exit": rsi,
         "closed": True,
     }
+    _close_position()
+    return trade
+
+
+def _try_open_position(asset: str, strategy: dict, price_data: dict) -> bool:
+    """Open a new position if entry fires and no position is open."""
+    if _load_position():
+        return False
+
+    if not _evaluate_entry(strategy, price_data):
+        return False
+
+    entry_price = price_data.get("close", 0.0)
+    if entry_price <= 0:
+        return False
+
+    direction = strategy.get("entry", {}).get("direction", "long")
+    position = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "asset": asset,
+        "direction": direction,
+        "entry_price": entry_price,
+        "strategy_version": strategy.get("version", "01"),
+        "rsi_at_entry": price_data.get("rsi"),
+    }
+    _save_position(position)
+    logger.info("position_open asset=%s direction=%s entry=%.4f rsi=%s",
+                asset, direction, entry_price,
+                f"{price_data.get('rsi'):.1f}" if price_data.get('rsi') else "n/a")
+    return True
 
 
 def _append_trade(trade: dict) -> None:
@@ -107,7 +164,7 @@ def _append_trade(trade: dict) -> None:
         f.write(json.dumps(trade) + "\n")
 
 
-def _write_heartbeat(asset: str, consecutive_failures: int) -> None:
+def _write_heartbeat(asset: str, consecutive_failures: int, open_position: bool) -> None:
     HEARTBEAT_PATH.write_text(
         json.dumps(
             {
@@ -115,6 +172,7 @@ def _write_heartbeat(asset: str, consecutive_failures: int) -> None:
                 "asset": asset,
                 "status": "ok" if consecutive_failures == 0 else "degraded",
                 "consecutive_failures": consecutive_failures,
+                "open_position": open_position,
             },
             indent=2,
         )
@@ -135,7 +193,6 @@ async def run_loop(asset: str, goal: dict) -> None:
                 logger.error("circuit_check consecutive_failures=%d", consecutive_failures)
                 if consecutive_failures >= CIRCUIT_BREAK_THRESHOLD:
                     logger.critical("Circuit breaker tripped — halting loop")
-                    _write_heartbeat(asset, consecutive_failures)
                     raise RuntimeError("Circuit breaker tripped after 5 consecutive failures")
             else:
                 consecutive_failures = 0
@@ -144,22 +201,35 @@ async def run_loop(asset: str, goal: dict) -> None:
         strategy = _load_strategy()
         price_data = market_data.get("price", {})
 
-        trade = _paper_trade(asset, strategy, price_data)
-        if trade:
-            _append_trade(trade)
-            logger.info("paper_trade asset=%s pnl_pct=%.4f rsi=%.1f", asset, trade["pnl_pct"], trade.get("rsi") or 0)
+        # Check open position for exit
+        closed_trade = _tick_position(strategy, price_data)
+        if closed_trade:
+            _append_trade(closed_trade)
+            logger.info("trade_closed asset=%s pnl_pct=%.4f reason=%s",
+                        asset, closed_trade["pnl_pct"], closed_trade["exit_reason"])
 
+        # Try to open new position if none open
+        _try_open_position(asset, strategy, price_data)
+
+        # Score only closed trades
         trades: list[dict] = []
         if TRADES_PATH.exists():
             for line in TRADES_PATH.read_text().splitlines():
                 line = line.strip()
                 if line:
-                    trades.append(json.loads(line))
+                    try:
+                        trades.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
 
         current_score = score(trades, goal)
-        logger.info("tick asset=%s score=%.3f strategy_v=%s", asset, current_score, strategy.get("version"))
+        open_pos = _load_position()
+        logger.info("tick asset=%s score=%.3f strategy_v=%s trades=%d in_position=%s rsi=%s",
+                    asset, current_score, strategy.get("version"), len(trades),
+                    bool(open_pos),
+                    f"{price_data.get('rsi'):.1f}" if price_data.get('rsi') else "n/a")
 
-        _write_heartbeat(asset, consecutive_failures)
+        _write_heartbeat(asset, consecutive_failures, bool(open_pos))
 
         elapsed = time.monotonic() - tick_start
         sleep_for = max(0.0, LOOP_INTERVAL_SECONDS - elapsed)
